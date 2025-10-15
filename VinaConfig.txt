@@ -1,0 +1,12 @@
+receptor=./receptors/target_prepared.pdbqt
+center_x = 3.229
+center_y = 6.273
+center_z = -12.98
+
+size_x = 6
+size_y = 6
+size_z = 6
+
+exhaustiveness = 8
+num_modes = 9
+energy_range = 3

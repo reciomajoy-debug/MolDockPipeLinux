@@ -1,0 +1,37 @@
+# config/run.yml
+# Docking run configuration for your local system
+
+box:
+  center_x: 0.6898
+  center_y: 64.81
+  center_z: 83.37
+  size_x: 12
+  size_y: 12
+  size_z: 12
+
+vina:
+  exhaustiveness: 8
+  num_modes: 9
+  energy_range: 3
+  seed: 42   # reproducibility, change/remove if you want different random search
+
+chemistry:
+  geometry_method: ETKDGv3+UFF   # or ETKDGv3+MMFF
+  force_field: UFF               # UFF or MMFF
+  minimize_steps: 200
+
+policy:
+  skip_if_has_result: true
+  max_retries: 2
+  sleep_between_retries: 2
+
+admet_rules:
+  lipinski: true
+  veber: true
+  egan: false
+  ghose: false
+  hard_fail: false
+
+tools:
+  meeko_cmd: "mk_prepare_ligand.py.exe"
+  vina_cmd: "./vina_1.2.7_win.exe"

@@ -1,0 +1,1 @@
+id,smiles,inchikey,admet_status,admet_reason,sdf_status,sdf_path,sdf_reason,pdbqt_status,pdbqt_path,pdbqt_reason,vina_status,vina_score,vina_pose,vina_reason,config_hash,receptor_sha1,tools_rdkit,tools_meeko,tools_vina,created_at,updated_at

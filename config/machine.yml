@@ -1,0 +1,17 @@
+# config/machine.yml
+tools:
+  obabel_cmd: "obabel"
+  meeko_cmd: "mk_prepare_ligand.py.exe"
+  vina_cmd: "./vina_1.2.7_win.exe"
+
+python:
+  version: "3.11.9"
+  env: "C:/Users/aaron/AppData/Local/Programs/Python/Python311/python.exe"
+
+paths:
+  input_dir: "./input"
+  sdf_dir: "./3D_Structures"
+  pdbqt_dir: "./prepared_ligands"
+  results_dir: "./results"
+  state_dir: "./state"
+  log_dir: "./logs"
