@@ -1,0 +1,10 @@
+receptor = ./receptors/target_prepared.pdbqt
+ligand_directory = ./prepared_ligands
+center_x = 3.229
+center_y = 6.273
+center_z = -12.98
+size_x = 6
+size_y = 6
+size_z = 6
+thread = 8000
+
