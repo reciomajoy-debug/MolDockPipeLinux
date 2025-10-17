@@ -384,12 +384,56 @@ def main():
         end = min(start_idx + batch_size, len(jobs))
         for i in range(start_idx, end):
             lig_id, sdf_path_str = jobs[i]
-            fut = executor.submit(worker_prepare, lig_id, sdf_path_str, meeko_cmd, python_exe, quiet_subprocess)
+            fut = executor.submit(worker_prepare, lig_id, sdf_path_str,
+                                  meeko_cmd, python_exe, quiet_subprocess)
             futures.append(fut)
             submitted += 1
         return end
 
-    batch_size = max_workers  # keep queue roughly one wave ahead
+    batch_size = max_workers
+    checkpoint_every_local = checkpoint_every  # <-- fix scope reference
+
+    try:
+        with Executor(max_workers=max_workers) as executor:
+            next_idx = submit_next_batch(0, batch_size)
+
+            while futures:
+                for fut in as_completed(list(futures)):
+                    futures.remove(fut)
+                    try:
+                        lig_id, ok, reason, out_pdbqt_path, sdf_path = fut.result()
+                    except Exception as e:
+                        lig_id = "?"
+                        ok = False
+                        reason = f"Worker error: {e}"
+                        out_pdbqt_path = ""
+                        sdf_path = ""
+
+                    # Update manifest
+                    if lig_id != "?":
+                        m = manifest.get(lig_id, {k: "" for k in MANIFEST_FIELDS})
+                        m["id"] = lig_id
+                        if sdf_path:
+                            m["sdf_path"] = sdf_path
+                        m["pdbqt_status"] = "DONE" if ok else "FAILED"
+                        m["pdbqt_path"] = out_pdbqt_path
+                        m["pdbqt_reason"] = "OK" if ok else reason
+                        m["config_hash"] = chash
+                        m["tools_meeko"] = MEEKO_VER or "Meeko"
+                        m.setdefault("created_at", created_ts)
+                        m["updated_at"] = now_iso()
+                        manifest[lig_id] = m
+                        done += int(ok)
+                        failed += int(not ok)
+
+                    total = done + failed
+                    if total and (total % checkpoint_every_local == 0):
+                        save_manifest(manifest)
+                        print(f"📒 Checkpoint — DONE: {done}  FAILED: {failed}")
+
+                    if not STOP_REQUESTED and not HARD_STOP and next_idx < len(jobs):
+                        next_idx = submit_next_batch(next_idx, batch_size)
+
 
     try:
         with Executor(max_workers=max_workers) as executor:
