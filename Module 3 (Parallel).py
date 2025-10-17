@@ -14,59 +14,39 @@ Module 3 (Parallel): SDF -> ligand PDBQT via Meeko
 Config knobs (config/run.yml or config/machine.yml):
 
   tools:
-    meeko_cmd: mk_prepare_ligand.py        # or absolute path; we try smart fallbacks
-    python_exe: python3.11                 # used for -m meeko.cli_prepare_ligand fallback
-
+    meeko_cmd: mk_prepare_ligand.py.exe   # or mk_prepare_ligand
+    python_exe: python
   policy:
-    skip_if_done: true                     # skip if PDBQT exists & validates
-    purge_old_meeko_logs: true             # delete old *.log in prepared_ligands
-    quiet_subprocess: true                 # squelch meeko stdout/stderr
-
+    skip_if_done: true
+    purge_old_meeko_logs: true
+    quiet_subprocess: true
   parallel:
     enabled: true
-    max_workers: null                      # auto: cores-1, capped at 8
-    backend: process                       # process|thread (Linux default overridden to thread)
-    checkpoint_every: 50                   # write manifest every N finished jobs
+    max_workers: 4         # default: min(8, max(1, cpu_count()-1))
+    backend: process       # process | thread
+    checkpoint_every: 50   # save manifest every N completions
+
+Run:  python "Module 3 (Parallel).py"
 """
 
 from __future__ import annotations
 import csv
 import hashlib
+import json
 import os
+import shlex
 import signal
 import subprocess
-import sys
-import tempfile
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Tuple
+from datetime import datetime, timezone
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from typing import Dict, Tuple
 
-try:
-    import yaml  # type: ignore
-except Exception:
-    yaml = None
-
-# ------------------------------ Paths ----------------------------------------
-
-ROOT = Path(__file__).resolve().parent
-DIR_SDF = (ROOT / "3D_Structures").resolve()
-DIR_PDBQT = (ROOT / "prepared_ligands").resolve()
-DIR_CONFIG = (ROOT / "config").resolve()
-DIR_STATE = (ROOT / "state").resolve()
-FILE_MANIFEST = (DIR_STATE / "manifest.csv").resolve()
-FILE_RUNYML = (DIR_CONFIG / "run.yml").resolve()
-FILE_MACHINEYML = (DIR_CONFIG / "machine.yml").resolve()
-
-DIR_PDBQT.mkdir(parents=True, exist_ok=True)
-DIR_STATE.mkdir(parents=True, exist_ok=True)
-
-# ------------------------------ Signals --------------------------------------
-
+# ------------------------------ Graceful stop --------------------------------
 STOP_REQUESTED = False
 HARD_STOP = False
 
-def _handle_sigint(signum, frame):
+def _handle_sigint(sig, frame):
     global STOP_REQUESTED, HARD_STOP
     if not STOP_REQUESTED:
         STOP_REQUESTED = True
@@ -81,48 +61,61 @@ signal.signal(signal.SIGINT, _handle_sigint)
 # ------------------------------ Optional: Meeko ver --------------------------
 try:
     import meeko  # type: ignore
-    MEEKO_VER = getattr(meeko, "__version__", "")
+    MEEKO_VER = getattr(meeko, "__version__", "unknown")
 except Exception:
     MEEKO_VER = ""
 
-# ------------------------------ Utilities ------------------------------------
+# ------------------------------ Optional YAML --------------------------------
+try:
+    import yaml  # pip install pyyaml
+except Exception:
+    yaml = None
 
-def sha1_file(p: Path) -> str:
-    h = hashlib.sha1()
-    with p.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+# ------------------------------ Paths ----------------------------------------
+BASE = Path(".").resolve()
+DIR_INPUT = BASE / "input"
+DIR_STATE = BASE / "state"
+DIR_SDF = BASE / "3D_Structures"
+DIR_PDBQT = BASE / "prepared_ligands"
+DIR_LOGS = BASE / "logs"
+
+FILE_INPUT = DIR_INPUT / "input.csv"
+FILE_MANIFEST = DIR_STATE / "manifest.csv"
+FILE_RUNYML = BASE / "config" / "run.yml"
+FILE_MACHINEYML = BASE / "config" / "machine.yml"
+
+for d in (DIR_PDBQT, DIR_LOGS):
+    d.mkdir(parents=True, exist_ok=True)
+
+# ------------------------------ Helpers --------------------------------------
 
 def now_iso() -> str:
-    import datetime as _dt
-    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-def deep_update(base: dict, other: dict) -> dict:
-    for k, v in (other or {}).items():
-        if isinstance(v, dict) and isinstance(base.get(k), dict):
-            deep_update(base[k], v)
-        else:
-            base[k] = v
-    return base
 
 def read_csv(path: Path) -> list[dict]:
     if not path.exists():
         return []
-    rows = []
-    with path.open("r", encoding="utf-8", newline="") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            rows.append({k: v for k, v in row.items()})
-    return rows
+    with path.open("r", newline="", encoding="utf-8") as f:
+        return [dict(row) for row in csv.DictReader(f)]
 
-def write_csv(path: Path, rows: Iterable[dict], fieldnames: list[str]) -> None:
+
+def write_csv(path: Path, rows: list[dict], headers: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=headers)
         w.writeheader()
-        for row in rows:
-            w.writerow(row)
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in headers})
+
+
+def deep_update(dst: dict, src: dict):
+    for k, v in (src or {}).items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            deep_update(dst[k], v)
+        else:
+            dst[k] = v
+
 
 def load_yaml(path: Path) -> dict:
     if not (yaml and path.exists()):
@@ -133,10 +126,11 @@ def load_yaml(path: Path) -> dict:
     except Exception:
         return {}
 
+
 def load_config() -> dict:
     cfg = {
         "tools": {
-            "meeko_cmd": "mk_prepare_ligand.py",
+            "meeko_cmd": "mk_prepare_ligand.py.exe",
             "python_exe": "python",
         },
         "policy": {
@@ -155,15 +149,17 @@ def load_config() -> dict:
     deep_update(cfg, load_yaml(FILE_MACHINEYML))
     return cfg
 
+
 def config_hash() -> str:
     chunks = []
     for p in (FILE_RUNYML, FILE_MACHINEYML):
         if p.exists():
-            chunks.append(sha1_file(p))
-    return hashlib.sha1(("|".join(chunks)).encode()).hexdigest()[:12]
+            chunks.append(p.read_text(encoding="utf-8"))
+    if not chunks:
+        chunks.append("{}")
+    return hashlib.sha1("||".join(chunks).encode("utf-8")).hexdigest()[:10]
 
 # ------------------------------ Manifest -------------------------------------
-
 MANIFEST_FIELDS = [
     "id","smiles","inchikey",
     "admet_status","admet_reason",
@@ -173,6 +169,7 @@ MANIFEST_FIELDS = [
     "config_hash","receptor_sha1","tools_rdkit","tools_meeko","tools_vina",
     "created_at","updated_at"
 ]
+
 
 def load_manifest() -> dict[str, dict]:
     if not FILE_MANIFEST.exists():
@@ -184,6 +181,7 @@ def load_manifest() -> dict[str, dict]:
         out[row["id"]] = row
     return out
 
+
 def save_manifest(manifest: dict[str, dict]) -> None:
     rows = [{k: v.get(k, "") for k in MANIFEST_FIELDS} for _, v in sorted(manifest.items())]
     write_csv(FILE_MANIFEST, rows, MANIFEST_FIELDS)
@@ -192,38 +190,49 @@ def save_manifest(manifest: dict[str, dict]) -> None:
 
 def discover_sdf(manifest: dict[str, dict]) -> dict[str, Path]:
     id2sdf: dict[str, Path] = {}
-    if not DIR_SDF.exists():
-        return id2sdf
-    for p in sorted(DIR_SDF.glob("*.sdf")):
-        lig_id = p.stem
-        id2sdf[lig_id] = p
-        if lig_id not in manifest:
-            manifest[lig_id] = {k: "" for k in MANIFEST_FIELDS}
-            manifest[lig_id]["id"] = lig_id
-            manifest[lig_id]["created_at"] = now_iso()
+    for lig_id, row in manifest.items():
+        p = (row.get("sdf_path") or "").strip()
+        if p:
+            path = Path(p)
+            if not path.is_absolute():
+                path = (BASE / p).resolve()
+            if path.exists():
+                id2sdf[lig_id] = path
+    for sdf in sorted(DIR_SDF.glob("*.sdf")):
+        lig_id = sdf.stem
+        id2sdf.setdefault(lig_id, sdf.resolve())
     return id2sdf
 
-def pdbqt_is_valid(p: Path) -> bool:
-    if not p.exists():
-        return False
+# ------------------------------ Validation -----------------------------------
+
+def pdbqt_is_valid(path: Path) -> bool:
     try:
-        # simple fast check: first line should contain "REMARK" or "ROOT" or "ATOM"
-        with p.open("r", encoding="utf-8", errors="ignore") as f:
-            head = f.read(2000)
-        if ("ROOT" in head) or ("ATOM" in head) or ("REMARK" in head):
-            return True
-        return False
+        if not path.exists() or path.stat().st_size < 200:
+            return False
+        txt = path.read_text(errors="ignore")
+        has_atom = ("ATOM " in txt) or ("HETATM" in txt)
+        has_tors = "TORSDOF" in txt
+        return has_atom and has_tors
     except Exception:
         return False
 
-# ------------------------------ Meeko runner ---------------------------------
+# ------------------------------ Meeko call (QUIET) ---------------------------
 
-def run_meeko_quiet(meeko_cmd: str, python_exe: str, in_sdf: Path, out_pdbqt: Path, quiet: bool=True) -> Tuple[bool, str]:
+def run_meeko_quiet(meeko_cmd: str, python_exe: str, in_sdf: Path, out_pdbqt: Path,
+                    quiet: bool = True) -> tuple[bool, str]:
     """
-    Try multiple ways of invoking Meeko to produce PDBQT.
+    Cross-platform Meeko caller with widened compatibility:
+      1) meeko_cmd (from config; e.g., mk_prepare_ligand.py.exe or mk_prepare_ligand)
+      2) mk_prepare_ligand
+      3) mk_prepare_ligand.py            # <— added for Linux/mac installs into ~/.local/bin
+      4) python -m meeko.main_prepare_ligand
+      5) python -m meeko.cli_prepare_ligand
+
     Writes to out_pdbqt.tmp first, validates, then renames.
     Returns (ok, reason)
     """
+    import shutil
+
     in_sdf = in_sdf.resolve()
     out_pdbqt = out_pdbqt.resolve()
     out_pdbqt.parent.mkdir(parents=True, exist_ok=True)
@@ -238,54 +247,36 @@ def run_meeko_quiet(meeko_cmd: str, python_exe: str, in_sdf: Path, out_pdbqt: Pa
             pass
 
     def _exec(cmd_list: list[str]) -> int:
-        """
-        Interruptible child process runner:
-        - Starts Meeko in its own process group (start_new_session=True)
-        - Polls so we can react to HARD_STOP quickly
-        """
-        import time
-        import errno
-        import signal as _signal
-
-        try:
-            proc = subprocess.Popen(
+        if quiet:
+            res = subprocess.run(
                 cmd_list,
-                stdout=(subprocess.DEVNULL if quiet else None),
-                stderr=(subprocess.DEVNULL if quiet else None),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 shell=False,
-                start_new_session=True,
             )
-        except FileNotFoundError:
-            return errno.ENOENT
+        else:
+            res = subprocess.run(cmd_list, shell=False)
+        return res.returncode
 
-        # polling loop
-        while True:
-            rc = proc.poll()
-            if rc is not None:
-                return rc
-            if HARD_STOP:
-                try:
-                    os.killpg(proc.pid, _signal.SIGTERM)
-                except Exception:
-                    pass
-                t0 = time.time()
-                while proc.poll() is None and time.time() - t0 < 2.0:
-                    time.sleep(0.05)
-                if proc.poll() is None:
-                    try:
-                        os.killpg(proc.pid, _signal.SIGKILL)
-                    except Exception:
-                        pass
-                return 128 + 15
-            time.sleep(0.05)
+    # Prefer actual paths on PATH if available
+    def _maybe(cmd):
+        exe = shutil.which(cmd[0]) if len(cmd) and not os.path.sep in cmd[0] else cmd[0]
+        if exe:
+            cmd = [exe] + cmd[1:]
+        return cmd
+
+    py = python_exe or "python"
 
     candidates = [
-        [meeko_cmd, "-i", str(in_sdf), "-o", str(tmp_pdbqt)],
-        ["mk_prepare_ligand", "-i", str(in_sdf), "-o", str(tmp_pdbqt)],
-        [python_exe, "-m", "meeko.cli_prepare_ligand", "-i", str(in_sdf), "-o", str(tmp_pdbqt)],
+        [meeko_cmd, "-i", str(in_sdf), "-o", str(tmp_pdbqt)],                # config override
+        ["mk_prepare_ligand", "-i", str(in_sdf), "-o", str(tmp_pdbqt)],      # typical console entry
+        ["mk_prepare_ligand.py", "-i", str(in_sdf), "-o", str(tmp_pdbqt)],   # Linux/mac in ~/.local/bin
+        [py, "-m", "meeko.main_prepare_ligand", "-i", str(in_sdf), "-o", str(tmp_pdbqt)],  # newer module path
+        [py, "-m", "meeko.cli_prepare_ligand",  "-i", str(in_sdf), "-o", str(tmp_pdbqt)],  # legacy module path
     ]
 
-    for cmd in candidates:
+    for raw in candidates:
+        cmd = _maybe(raw)
         try:
             rc = _exec(cmd)
             if rc == 0 and pdbqt_is_valid(tmp_pdbqt):
@@ -296,14 +287,12 @@ def run_meeko_quiet(meeko_cmd: str, python_exe: str, in_sdf: Path, out_pdbqt: Pa
         except Exception:
             continue
 
-    # Cleanup tmp on failure
     try:
         if tmp_pdbqt.exists():
             tmp_pdbqt.unlink()
     except Exception:
         pass
     return False, "All Meeko attempts failed"
-
 # ------------------------------ Worker ---------------------------------------
 
 def worker_prepare(lig_id: str, sdf_path_str: str, meeko_cmd: str, python_exe: str, quiet: bool) -> Tuple[str, bool, str, str, str]:
@@ -330,8 +319,7 @@ def main():
 
     par = cfg.get("parallel", {})
     par_enabled = bool(par.get("enabled", True))
-    default_backend = "thread" if os.name == "posix" else "process"
-    backend = str(par.get("backend", default_backend)).lower()
+    backend = str(par.get("backend", "process")).lower()
     max_workers = par.get("max_workers")
     if not max_workers:
         # reasonable default, keep one core free; cap at 8 unless user raises it
@@ -345,29 +333,32 @@ def main():
     manifest = load_manifest()
     id2sdf = discover_sdf(manifest)
     if not id2sdf:
-        raise SystemExit("❌ No SDF files found in 3D_Structures")
+        raise SystemExit("❌ No SDFs found. Run Module 2 first.")
 
-    # Purge old logs if requested
+    # Optional: purge old *_meeko.log that can confuse downstream tools
     if purge_old_logs:
-        for p in DIR_PDBQT.glob("*.log"):
+        for logf in DIR_PDBQT.glob("*_meeko.log"):
             try:
-                p.unlink()
+                logf.unlink()
             except Exception:
                 pass
 
-    # Build job list
-    jobs: list[tuple[str, str]] = []
+    # Build job list, honoring skip_if_done
+    jobs: list[tuple[str, str]] = []  # (lig_id, sdf_path_str)
     for lig_id, sdf_path in sorted(id2sdf.items()):
-        mrow = manifest.get(lig_id) or {}
-        out_pdbqt = (DIR_PDBQT / f"{lig_id}.pdbqt")
-        if skip_if_done and out_pdbqt.exists() and pdbqt_is_valid(out_pdbqt):
-            # mark as done
-            mrow["pdbqt_status"] = "DONE"
-            mrow["pdbqt_path"] = str(out_pdbqt.resolve())
-            mrow["pdbqt_reason"] = "OK (pre-existing)"
-            mrow["tools_meeko"] = MEEKO_VER
-            mrow["updated_at"] = now_iso()
-            manifest[lig_id] = mrow
+        out_pdbqt = (DIR_PDBQT / f"{lig_id}.pdbqt").resolve()
+        if skip_if_done and pdbqt_is_valid(out_pdbqt):
+            m = manifest.get(lig_id, {k: "" for k in MANIFEST_FIELDS})
+            m["id"] = lig_id
+            m["sdf_path"] = str(sdf_path)
+            m["pdbqt_status"] = "DONE"
+            m["pdbqt_path"] = str(out_pdbqt)
+            m["pdbqt_reason"] = "Found existing valid PDBQT"
+            m["config_hash"] = chash
+            m["tools_meeko"] = MEEKO_VER or "Meeko"
+            m.setdefault("created_at", now_iso())
+            m["updated_at"] = now_iso()
+            manifest[lig_id] = m
             continue
         jobs.append((lig_id, str(sdf_path)))
 
@@ -393,78 +384,62 @@ def main():
         end = min(start_idx + batch_size, len(jobs))
         for i in range(start_idx, end):
             lig_id, sdf_path_str = jobs[i]
-            fut = executor.submit(worker_prepare, lig_id, sdf_path_str, meeko_cmd, python_exe,
-                                  quiet_subprocess)
+            fut = executor.submit(worker_prepare, lig_id, sdf_path_str, meeko_cmd, python_exe, quiet_subprocess)
             futures.append(fut)
             submitted += 1
         return end
 
+    batch_size = max_workers  # keep queue roughly one wave ahead
+
     try:
         with Executor(max_workers=max_workers) as executor:
-            next_idx = 0
-            # Prime the queue
-            next_idx = submit_next_batch(next_idx, max_workers)
+            next_idx = submit_next_batch(0, batch_size)
 
+            # Consume as completed; keep the pipeline full unless stop requested
             while futures:
-                if HARD_STOP:
-                    # Hard stop: don’t submit more; fall through to drain/cancel
-                    pass
-                elif not STOP_REQUESTED and next_idx < len(jobs):
-                    # Keep queue topped up
-                    next_idx = submit_next_batch(next_idx, max_workers - sum(1 for f in futures if not f.done()))
-
-                # Wait for something to finish
-                for fut in as_completed(list(futures), timeout=0.25):
+                for fut in as_completed(list(futures)):
                     futures.remove(fut)
                     try:
-                        lig_id, ok, reason, out_pdbqt, sdf_path = fut.result()
+                        lig_id, ok, reason, out_pdbqt_path, sdf_path = fut.result()
                     except Exception as e:
-                        ok = False
+                        # A worker crashed before returning
                         lig_id = "?"
-                        reason = f"worker exception: {e}"
-                        out_pdbqt = ""
+                        ok = False
+                        reason = f"Worker error: {e}"
+                        out_pdbqt_path = ""
                         sdf_path = ""
 
-                    # Update manifest row
-                    if lig_id not in manifest:
-                        manifest[lig_id] = {k: "" for k in MANIFEST_FIELDS}
-                        manifest[lig_id]["id"] = lig_id
-                        manifest[lig_id]["created_at"] = created_ts
+                    # Update manifest row atomically in main process
+                    if lig_id != "?":
+                        m = manifest.get(lig_id, {k: "" for k in MANIFEST_FIELDS})
+                        m["id"] = lig_id
+                        if sdf_path:
+                            m["sdf_path"] = sdf_path
+                        m["pdbqt_status"] = "DONE" if ok else "FAILED"
+                        m["pdbqt_path"] = out_pdbqt_path
+                        m["pdbqt_reason"] = "OK" if ok else reason
+                        m["config_hash"] = chash
+                        m["tools_meeko"] = MEEKO_VER or "Meeko"
+                        m.setdefault("created_at", created_ts)
+                        m["updated_at"] = now_iso()
+                        manifest[lig_id] = m
+                        done += int(ok)
+                        failed += int(not ok)
 
-                    row = manifest[lig_id]
-                    row["pdbqt_path"] = out_pdbqt
-                    row["sdf_path"] = sdf_path
-                    row["tools_meeko"] = MEEKO_VER
-                    row["config_hash"] = chash
-                    row["updated_at"] = now_iso()
-
-                    if ok:
-                        row["pdbqt_status"] = "DONE"
-                        row["pdbqt_reason"] = reason
-                        done += 1
-                    else:
-                        row["pdbqt_status"] = "FAILED"
-                        row["pdbqt_reason"] = reason
-                        failed += 1
-
-                    # Checkpoint
+                    # Periodic checkpoints
                     total = done + failed
-                    if total % checkpoint_every == 0:
+                    if total and (total % checkpoint_every == 0):
                         save_manifest(manifest)
-                        print(f"… checkpoint: {total}/{len(jobs)} (done={done} failed={failed})")
+                        print(f"📒 Checkpoint — DONE: {done}  FAILED: {failed}")
 
-                # User asked to stop → don’t submit more; drain queue
+                    # Top up queue if not stopping
+                    if not STOP_REQUESTED and not HARD_STOP and next_idx < len(jobs):
+                        next_idx = submit_next_batch(next_idx, batch_size)
+
+                # If stop requested, let current futures drain without adding new ones
                 if STOP_REQUESTED or HARD_STOP:
                     if not futures:  # drained
                         break
-
-        # If stop requested, cancel anything not yet started
-        try:
-            if (STOP_REQUESTED or HARD_STOP) and futures:
-                for _f in list(futures):
-                    _f.cancel()
-        except Exception:
-            pass
 
     finally:
         # Final flush
@@ -474,6 +449,7 @@ def main():
         print(f"   Manifest updated: {FILE_MANIFEST}")
         if STOP_REQUESTED or HARD_STOP:
             print("   (Exited early by user request.)")
+
 
 if __name__ == "__main__":
     main()
