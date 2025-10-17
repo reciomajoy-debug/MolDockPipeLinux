@@ -322,13 +322,13 @@ def main():
     backend = str(par.get("backend", "process")).lower()
     max_workers = par.get("max_workers")
     if not max_workers:
-        # reasonable default, keep one core free; cap at 8 unless user raises it
         try:
             cpu = os.cpu_count() or 2
         except Exception:
             cpu = 2
-        max_workers = max(1, min(8, cpu - 1))
-    checkpoint_every = int(par.get("checkpoint_every", 50))
+        # use 90% of cores but leave at least one free
+        reserve = max(1, int(cpu * 0.1))  # keep ~10% free
+        max_workers = max(1, cpu - reserve)
 
     manifest = load_manifest()
     id2sdf = discover_sdf(manifest)
