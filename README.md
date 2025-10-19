@@ -1,11 +1,17 @@
-# 🧪 Automated Virtual Screening Pipeline
+# 🧪 Manual Virtual Screening Workflow
 
-A modular and reproducible **virtual screening system** for drug discovery.  
-This pipeline integrates **ADMET filtering, 3D structure generation, ligand preparation, and docking with AutoDock Vina**, with robust provenance tracking and clean restarts.
+MolDockPipe now ships as a collection of **standalone automation scripts** for
+small-molecule drug discovery. Each module still handles ADMET triaging,
+conformer generation, ligand preparation, or AutoDock Vina docking, and the
+helpers continue to track results in a manifest so reruns remain deterministic.
+
+> **Note:** The former pipeline orchestrator (`run_pipeline.py`) and related
+> checkpointing helpers have been removed. Execute the numbered modules
+> manually to run the full workflow.
 
 ---
 
-## 📂 Pipeline Overview
+## 📂 Module Overview
 
 The system is divided into four modules, each of which can be run independently or sequentially:
 
@@ -65,14 +71,14 @@ A central **`state/manifest.csv`** records per-ligand progress through the pipel
 - **Vina**: docking score, pose path, receptor SHA1  
 - **Provenance**: config hashes, RDKit/Meeko/Vina versions, timestamps  
 
-This makes the pipeline **idempotent** (safe to re-run without duplication).
+This makes the workflow **idempotent** (safe to re-run without duplication).
 
 ---
 
 ## ⚙️ Installation
 
 ### Requirements
-- Python **3.10+**
+- Python **3.11** (the modules and orchestrator rely on 3.11-specific syntax and standard-library behavior)
 - [RDKit](https://www.rdkit.org/)
 - [Meeko](https://github.com/forlilab/meeko)  
 - [AutoDock Vina](http://vina.scripps.edu/) (binary placed in project root)  
@@ -117,6 +123,12 @@ python Module\ 3.py
 # 4. Docking
 python Module\ 4.py
 ```
+
+### Removed Automation Layer
+Earlier versions included a `run_pipeline.py` helper that automatically chained
+modules with checkpoints and sanitized logs. That orchestration layer has been
+retired, so the numbered scripts are the source of truth for running the
+workflow.
 
 ### 3. Reset Pipeline
 ```bash
