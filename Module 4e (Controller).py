@@ -84,7 +84,7 @@ def load_manifest(path: Path) -> Dict[str, dict]:
     return out
 
 def save_manifest(path: Path, manifest: Dict[str, dict]) -> None:
-    rows = [{k: v.get(k, "") for k in MANIFEST_FIELDS} for _, v in sorted(manifest.items())]
+    rows = [{k: v.get(k, "") for k in MANIFEST_FIELDS} for _, v in manifest.items()]
     atomic_write_csv(path, rows, MANIFEST_FIELDS)
 
 # ------------------------------ GPU detection ------------------------------
@@ -224,25 +224,54 @@ def _best_score_from_pose(pose_path: Path) -> str:
     except Exception:
         return ""
 
-def _ts(s: str) -> str:
-    return s or ""
-
 def _merge_into(dest: Dict[str, dict], src_rows: List[dict]) -> Tuple[int,int]:
-    """Merge rows into dest by id, keeping the row with latest updated_at.
-       Returns (added, updated) counts."""
+    """Merge rows into dest by id while preserving prior module fields.
+
+    Returns (added, updated) counts."""
     added, updated = 0, 0
     for r in src_rows:
         rid = r.get("id", "")
         if not rid:
             continue
-        row = {k: r.get(k, "") for k in MANIFEST_FIELDS}
+
+        incoming = {k: r.get(k, "") for k in MANIFEST_FIELDS}
+
+        # Normalise timestamps when one of them is missing
+        if not incoming.get("created_at") and incoming.get("updated_at"):
+            incoming["created_at"] = incoming["updated_at"]
+        if not incoming.get("updated_at") and incoming.get("created_at"):
+            incoming["updated_at"] = incoming["created_at"]
+
         if rid in dest:
-            old = dest[rid]
-            if _ts(row.get("updated_at","")) >= _ts(old.get("updated_at","")):
-                dest[rid] = row
+            base = dest[rid]
+            changed = False
+
+            # Preserve the earliest created_at, but allow filling if it was empty
+            inc_created = incoming.get("created_at", "")
+            base_created = base.get("created_at", "")
+            if inc_created and (not base_created or inc_created < base_created):
+                base["created_at"] = inc_created
+                changed = True
+
+            # Field-by-field merge: prefer incoming non-empty values
+            for field in MANIFEST_FIELDS:
+                if field in ("id", "created_at", "updated_at"):
+                    continue
+                inc_val = incoming.get(field, "")
+                if inc_val and inc_val != base.get(field, ""):
+                    base[field] = inc_val
+                    changed = True
+
+            # Updated_at keeps the most recent timestamp
+            inc_updated = incoming.get("updated_at", "")
+            if inc_updated and inc_updated > base.get("updated_at", ""):
+                base["updated_at"] = inc_updated
+                changed = True
+
+            if changed:
                 updated += 1
         else:
-            dest[rid] = row
+            dest[rid] = incoming
             added += 1
     return added, updated
 
