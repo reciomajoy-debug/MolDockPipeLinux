@@ -103,15 +103,33 @@ MANIFEST_FIELDS = [
 def load_manifest(path: Path)->dict[str,dict]:
     if not path.exists():
         return {}
-    out={}
+    out: dict[str, dict] = {}
     for r in read_csv(path):
-        row={k:r.get(k,"") for k in MANIFEST_FIELDS}
-        out[row.get("id"," ")] = row
+        row = {k: r.get(k, "") for k in MANIFEST_FIELDS}
+        rid = row.get("id", "")
+        if rid:
+            out[rid] = row
     return out
 
 def save_manifest(path: Path, manifest:dict[str,dict])->None:
-    rows = [{k:v.get(k,"") for k in MANIFEST_FIELDS} for _,v in sorted(manifest.items())]
+    rows = [{k:v.get(k,"") for k in MANIFEST_FIELDS} for _,v in manifest.items()]
     atomic_write_csv(path, rows, MANIFEST_FIELDS)
+
+def seeded_row(lig_id: str, manifest: dict[str, dict], global_seed: dict[str, dict]) -> dict:
+    """Start from global manifest data (if any) and overlay per-GPU values."""
+    row = {k: "" for k in MANIFEST_FIELDS}
+    base = global_seed.get(lig_id)
+    if base:
+        for k in MANIFEST_FIELDS:
+            row[k] = base.get(k, "")
+    existing = manifest.get(lig_id)
+    if existing:
+        for k in MANIFEST_FIELDS:
+            val = existing.get(k, "")
+            if val:
+                row[k] = val
+    row["id"] = lig_id
+    return row
 
 # -------------------------- Atom-types check --------------------------
 
@@ -333,6 +351,7 @@ def main():
 
     # Load OR initialize the per-GPU manifest snapshot (not the global)
     manifest = load_manifest(per_manifest_path) if per_manifest_path.exists() else {}
+    global_seed = load_manifest(FILE_MANIFEST_GLOBAL) if FILE_MANIFEST_GLOBAL.exists() else {}
 
     created_ts = now_iso()
     receptor_sha = sha1_of_file(receptor)
@@ -343,14 +362,15 @@ def main():
         ok, why = pdbqt_has_only_allowed_types(lig)
         if not ok:
             lig_id = lig.stem
-            m = manifest.get(lig_id, {k:"" for k in MANIFEST_FIELDS})
-            m["id"]=lig_id
+            m = seeded_row(lig_id, manifest, global_seed)
             m["pdbqt_path"]=str(lig.resolve())
             m["vina_status"]="FAILED"
             m["vina_reason"]=why
-            m.setdefault("created_at", created_ts)
+            if not m.get("created_at"):
+                m["created_at"] = created_ts
             m["updated_at"]=now_iso()
             manifest[lig_id]=m
+            global_seed[lig_id] = {k: m.get(k, "") for k in MANIFEST_FIELDS}
             print(f"⚠️  Skipping {lig.name} — {why}", flush=True)
         else:
             valid_pending.append(lig)
@@ -390,8 +410,7 @@ def main():
                 lig_id = lig.stem
                 pose = out_dir / f"{lig_id}_out.pdbqt"
                 ok,best = vina_pose_is_valid(pose)
-                m = manifest.get(lig_id, {k:"" for k in MANIFEST_FIELDS})
-                m["id"]=lig_id
+                m = seeded_row(lig_id, manifest, global_seed)
                 m["pdbqt_path"]=str(lig.resolve())
                 m["vina_status"]="DONE" if ok else "FAILED"
                 m["vina_pose"]=str(pose.resolve())
@@ -400,9 +419,11 @@ def main():
                 m["config_hash"]=chash
                 m["receptor_sha1"]=receptor_sha
                 m["tools_vina"]=str(vgpu)
-                m.setdefault("created_at", created_ts)
+                if not m.get("created_at"):
+                    m["created_at"] = created_ts
                 m["updated_at"]=now_iso()
                 manifest[lig_id]=m
+                global_seed[lig_id] = {k: m.get(k, "") for k in MANIFEST_FIELDS}
 
             # Write ONLY the per-GPU manifest (controller merges later)
             save_manifest(per_manifest_path, manifest)
