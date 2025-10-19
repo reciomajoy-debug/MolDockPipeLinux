@@ -6,6 +6,10 @@ Files
 - run_pipeline.py — main orchestrator
 - utils_text.py   — emoji/Unicode sanitizer
 
+Prerequisites
+-------------
+- Python 3.11
+
 How to use
 ----------
 1) Place run_pipeline.py and utils_text.py in the SAME FOLDER as your module scripts:
